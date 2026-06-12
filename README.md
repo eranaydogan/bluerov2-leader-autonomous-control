@@ -104,7 +104,3 @@ Total packet size: **36 Bytes**.
 ---
 
 *This system is designed targeting BlueROV2 research and future ROS2 integration.*
-
-```
-
-```
