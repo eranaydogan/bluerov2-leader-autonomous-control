@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LIDER OTONOM ALAN TARAMA SCRIPTI 
+LIDER OTONOM ALAN TARAMA SCRIPTI
 ============================================================
 
 - Pozisyon: dunya-frame delta (wx-START_X, -(wz-START_Z), height-START_Y)
@@ -15,42 +15,56 @@ import math
 import argparse
 
 # ============================================================
-# CONFIG  
+# CONFIG
 # ============================================================
 
 EMERGENCY_IP = "127.0.0.1"
 EMERGENCY_PORT = 5012
 
 START_X = -152.0
-START_Y = -145.35      
+START_Y = -145.35
 START_Z = 923.0
 
 CORNER_A = (-152.0, 915.0)
-CORNER_B = (-100.0, 915.0)    
-CORNER_C = (-100.0, 860.0)    
+CORNER_B = (-100.0, 915.0)
+CORNER_C = (-100.0, 860.0)
 CORNER_D = (-150.0, 860.0)
 
-VEL_SMOOTH_TAU = 0.4 
+VEL_SMOOTH_TAU = 0.4
 
 LEAK_X = -114.991
 LEAK_Z = 871.2
 # ---- Sizinti spiral ayarlari ----
-R_TRIGGER = 16.0        # bu menzile girince spirale gec (tarama biter)
-R_STOP = 8            # spiral bu yaricapa inince dur + emergency
-SPIRAL_TURNS = 1.5      # R_TRIGGER'dan R_STOP'a inerken kac tam tur
+R_TRIGGER = 14.0        # bu menzile girince spirale gec (tarama biter)
+R_STOP = 6              # spiral bu yaricapa inince dur + emergency
+SPIRAL_TURNS = 2.5      # R_TRIGGER'dan R_STOP'a inerken kac tam tur
+
+# Spiral icin OZEL yaw rate: en kucuk yaricapi (R_STOP) donebilmeli.
+# Tarama icin MAX_YAW_RATE_RAD (genis/yumusak) kullanilir; spiral'de
+# daha keskin donus gerektigi icin bu daha yuksek deger devreye girer.
+# (CRUISE_SPEED asagida tanimlandiktan SONRA hesaplaniyor -- bkz. altta.)
 
 NUM_STRIPS = 5
 
 # ---- Hareket Kinematigi ---- cruise speed 0.80 Max_pose_step_per_packet 0.032 iken iyi sonuc veriyor
 SEND_HZ = 60.0
-CRUISE_SPEED = 0.80               
-TURN_RADIUS = 12                 
-MAX_YAW_RATE_RAD = CRUISE_SPEED / TURN_RADIUS 
-LOOKAHEAD_DIST = 16.0              
+CRUISE_SPEED = 1
+TURN_RADIUS = 9
+MAX_YAW_RATE_RAD = CRUISE_SPEED / TURN_RADIUS
+LOOKAHEAD_DIST = 10.0   # 16 -> 12: biraz daha siki U donusu (cok dusurme: salinim geri gelir)
 
-MAX_POS_STEP_PER_PACKET = 0.032   
-WAYPOINT_TOL = 0.5               
-STARTUP_HOLD_SEC = 6            
+# >>> SPIRAL'E OZEL YAW RATE (CRUISE_SPEED ve R_STOP tanimli oldugu icin BURADA) <<<
+# R_STOP yaricapli cemberi donmek icin gereken min yaw = CRUISE_SPEED / R_STOP.
+# 0.7 carpani -> bir miktar fazladan donus kapasitesi (guvenlik payi).
+SPIRAL_MAX_YAW_RATE = CRUISE_SPEED / (R_STOP * 0.7)
+
+MAX_POS_STEP_PER_PACKET = 0.04
+WAYPOINT_TOL = 0.5
+STARTUP_HOLD_SEC = 6
+
+# Emergency'yi spiral tam bitmese bile garantiye almak icin:
+# leak'e GERCEK mesafe bu degerin altina inerse de emergency gonderilir.
+EMERGENCY_DIST_FALLBACK = R_STOP + 4.0   # ~8 birim: spiral takilsa bile emergency garantili
 
 # ============================================================
 UDP_IP = "127.0.0.1"
@@ -114,6 +128,18 @@ def send_pose(sock, wx, wz, height, yaw, t, seq, dt):
         float(t), float(seq), float(dt))
     sock.sendto(data, (UDP_IP, UDP_PORT))
 
+def send_emergency(reason_text, final_d):
+    """Unity'ye emergency tetigi gonder (5012). UDP kaybina karsi 5 kez."""
+    try:
+        emer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(5):
+            emer_sock.sendto(b"EMERGENCY", (EMERGENCY_IP, EMERGENCY_PORT))
+        emer_sock.close()
+        print(f"\n>>> SIZINTIYA ULASILDI ({reason_text}, merkeze {final_d:.1f} birim) "
+              f"-- DURULUYOR + EMERGENCY GONDERILDI (5012).\n")
+    except Exception as e:
+        print(f"[UYARI] Emergency gonderilemedi: {e}")
+
 # --------------------------- main ---------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -138,7 +164,8 @@ def main():
     vx, vz = 0.0, 0.0
     wp_idx = 0
     mission_done = False
-    
+    emergency_sent = False
+
     # ---- Spiral durumu ----
     spiral_active = False
     spiral_theta = 0.0          # merkez etrafindaki aci (rad)
@@ -150,14 +177,12 @@ def main():
     wait_start_time = 0.0
     WAIT_DURATION = 15.0
 
-    # Baslangic heading'i ilk serit yonune (wp0 -> wp1) gore kurulsun,
-    # boylece hold bitince arac zaten gidecegi yone bakiyor olur.
-    # Gazebo kamerasinin hizasi icin arac -Z yonune bakarak baslar.
-    # Hedefe donus, hareketle birlikte MAX_YAW_RATE limitiyle yumusak yapilir.
     kinematic_yaw_rad = math.pi   # -Z yonu (yaw=180)
 
     print("=" * 70)
     print(f"MOD: {args.mode}    HEDEF UDP: {UDP_IP}:{UDP_PORT}")
+    print(f"SPIRAL: R_TRIGGER={R_TRIGGER} R_STOP={R_STOP} TURNS={SPIRAL_TURNS} "
+          f"yaw_rate(tarama)={MAX_YAW_RATE_RAD:.3f} yaw_rate(spiral)={SPIRAL_MAX_YAW_RATE:.3f}")
     print("=" * 70)
 
     start_time = time.perf_counter()
@@ -182,20 +207,16 @@ def main():
 
             if mission_done:
                 target_vx = target_vz = 0.0
-            
+
             elif spiral_active:
                 # ---- SPIRAL MODU: sizinti etrafinda daralarak merkeze ----
-                # Her turda yaricap R_TRIGGER -> R_STOP arasinda azalir.
-                # Yaricap dustukce hedef nokta merkeze yaklasir.
                 dr_per_rad = (R_TRIGGER - R_STOP) / (SPIRAL_TURNS * 2.0 * math.pi)
 
-                # Acisal ilerleme: cizgisel hizi koru -> kucuk yaricapta daha hizli don
                 eff_r = max(spiral_r, 1.0)
                 dtheta = (CRUISE_SPEED / eff_r) * dt
                 spiral_theta = wrap_rad(spiral_theta + dtheta)
                 spiral_r = max(R_STOP, spiral_r - dr_per_rad * dtheta)
 
-                # Spiral uzerindeki hedef nokta (carrot)
                 carrot_x = LEAK_X + spiral_r * math.sin(spiral_theta)
                 carrot_z = LEAK_Z + spiral_r * math.cos(spiral_theta)
 
@@ -206,27 +227,23 @@ def main():
                 if dist_carrot > 0.001:
                     target_heading_rad = math.atan2(dx, dz)
                     err_rad = wrap_rad(target_heading_rad - kinematic_yaw_rad)
-                    step_rad = clamp(err_rad, -MAX_YAW_RATE_RAD * dt, MAX_YAW_RATE_RAD * dt)
+                    # SPIRAL'E OZEL yuksek yaw rate (keskin donus icin)
+                    step_rad = clamp(err_rad, -SPIRAL_MAX_YAW_RATE * dt, SPIRAL_MAX_YAW_RATE * dt)
                     kinematic_yaw_rad = wrap_rad(kinematic_yaw_rad + step_rad)
 
                 target_vx = math.sin(kinematic_yaw_rad) * CRUISE_SPEED
                 target_vz = math.cos(kinematic_yaw_rad) * CRUISE_SPEED
 
-                # Merkeze yeterince yaklastik mi?
-                if spiral_r <= R_STOP + 0.05:
+                # Merkeze ulasildi mi? (spiral yaricapi R_STOP'a indi VEYA
+                # gercek mesafe yeterince kucuk -> emergency'yi GARANTIYE al)
+                real_d = math.hypot(LEAK_X - wx, LEAK_Z - wz)
+                if (spiral_r <= R_STOP + 0.05) or (real_d <= EMERGENCY_DIST_FALLBACK):
                     mission_done = True
-                    final_d = math.hypot(LEAK_X - wx, LEAK_Z - wz)
-                    # Sizintiya ulasildi -> Unity'ye emergency tetigi gonder (5012)
-                    try:
-                        emer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        for _ in range(5):   # UDP kaybina karsi birkac kez yolla
-                            emer_sock.sendto(b"EMERGENCY", (EMERGENCY_IP, EMERGENCY_PORT))
-                        emer_sock.close()
-                        print(f"\n>>> SIZINTIYA ULASILDI (merkeze {final_d:.1f} birim) "
-                              f"-- DURULUYOR + EMERGENCY GONDERILDI (5012).\n")
-                    except Exception as e:
-                        print(f"[UYARI] Emergency gonderilemedi: {e}")      
-                    
+                    if not emergency_sent:
+                        emergency_sent = True
+                        reason = "spiral tamam" if spiral_r <= R_STOP + 0.05 else "mesafe-yedek"
+                        send_emergency(reason, real_d)
+
             else:
                 if is_waiting:
                     target_vx = target_vz = 0.0
@@ -249,7 +266,6 @@ def main():
                     if args.mode == "mission" and not spiral_active \
                             and math.hypot(LEAK_X - wx, LEAK_Z - wz) < R_TRIGGER:
                         spiral_active = True
-                        # Spirale mevcut konumdan basla: anlik yaricap ve aci
                         spiral_r = math.hypot(wx - LEAK_X, wz - LEAK_Z)
                         spiral_theta = math.atan2(wx - LEAK_X, wz - LEAK_Z)
                         print(f"\n>>> SIZINTI MENZILINDE (r={spiral_r:.1f}) "
@@ -342,8 +358,13 @@ def main():
             send_pose(sock, wx, wz, height, visual_yaw, now - start_time, seq, dt)
 
             if seq % int(SEND_HZ) == 0 and not is_waiting:
-                state = "DONE" if mission_done else f"wp {wp_idx + 1}/{len(waypoints)}"
-                print(f"seq={seq:05d} {state:10s} Pos=({wx:+.3f},{wz:+.3f}) vis_yaw={visual_yaw:+6.1f}")
+                if spiral_active and not mission_done:
+                    state = f"SPIRAL r={spiral_r:.1f}"
+                elif mission_done:
+                    state = "DONE"
+                else:
+                    state = f"wp {wp_idx + 1}/{len(waypoints)}"
+                print(f"seq={seq:05d} {state:14s} Pos=({wx:+.3f},{wz:+.3f}) vis_yaw={visual_yaw:+6.1f}")
 
             seq += 1
             sl = DT - (time.perf_counter() - loop_start)

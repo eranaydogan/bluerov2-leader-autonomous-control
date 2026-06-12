@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""
+MANUEL KLAVYE KONTROLCUSU (Sadece WASD ve Yaw)
+============================================================
+Gereksinim: pip install pynput
+
+Kontroller:
+- W/S: Aracın baktığı yöne göre İleri/Geri
+- A/D: Aracın baktığı yöne göre Sola/Sağa kayma (Strafing)
+- Sol/Sağ Ok: Yaw (Sağa sola dönüş)
+- ESC: Çıkış
+"""
+
+import socket
+import struct
+import time
+import math
+from pynput import keyboard
+
+# ============================================================
+# CONFIG
+# ============================================================
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5007
+SEND_HZ = 60.0
+DT = 0.8 / SEND_HZ
+
+# Başlangıç Dünya Koordinatları (Override Referansları)
+START_X = -152.0
+START_Y = -145.35
+START_Z = 923.0
+
+# Hareket Hızları
+MOVE_SPEED = 1.0        # Birim/saniye
+YAW_RATE = 5.0         # Derece/saniye
+
+# ============================================================
+packet_format = struct.Struct("<9f")
+
+# Global tuş basım durumlarını tutacağımız küme
+pressed_keys = set()
+
+def on_press(key):
+    pressed_keys.add(key)
+
+def on_release(key):
+    if key in pressed_keys:
+        pressed_keys.remove(key)
+    # ESC tuşu ile programı güvenli kapatma
+    if key == keyboard.Key.esc:
+        return False
+
+def wrap_deg(a):
+    """Açıyı -180 ile +180 derece arasında tutar."""
+    return (a + 180.0) % 360.0 - 180.0
+
+def clamp(v, lo, hi):
+    """Değeri belirtilen aralığa sıkıştırır."""
+    return max(lo, min(hi, v))
+
+def send_pose(sock, wx, wz, height, yaw, t, seq, dt):
+    """
+    Dünya koordinatlarını simülasyon koordinatlarına çevirerek UDP basar.
+    Pitch ve Roll değerleri 0.0 olarak sabitlenmiştir.
+    """
+    data = packet_format.pack(
+        float(wx - START_X),       # Unity X (Right)
+        float(-(wz - START_Z)),    # Unity Z (Forward) -> -Z ekseni dönüşümü
+        float(height - START_Y),   # Unity Y (Up)
+        0.0,                       # Pitch (Sabit 0)
+        0.0,                       # Roll  (Sabit 0)
+        float(yaw),                # Yaw
+        float(t),
+        float(seq),
+        float(dt)
+    )
+    sock.sendto(data, (UDP_IP, UDP_PORT))
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    # Başlangıç pozisyon ve oryantasyonları
+    wx, wz = START_X, START_Z
+    height = START_Y
+    yaw = 180.0   # Araç -Z yönüne bakarak başlar
+    
+    seq = 0
+    start_time = time.perf_counter()
+    last_time = start_time
+
+    # Klavye dinleyicisini başlat (Non-blocking)
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    print("=" * 60)
+    print(f"KLAVYE KONTROLU AKTIF -> HEDEF: {UDP_IP}:{UDP_PORT}")
+    print("W/S: Ileri/Geri | A/D: Sag/Sol | SOL/SAG OK: Yaw | ESC: Cikis")
+    print("=" * 60)
+
+    try:
+        while listener.running:
+            loop_start = time.perf_counter()
+            now = loop_start
+            dt = clamp(now - last_time, 0.0, 0.05) # Ani sıçramaları önle
+            last_time = now
+
+            # ------------------------------------------------
+            # 1. ORYANTASYON GÜNCELLEMELERİ (Sadece Yaw)
+            # ------------------------------------------------
+            if keyboard.Key.left in pressed_keys:
+                yaw -= YAW_RATE * dt
+            if keyboard.Key.right in pressed_keys:
+                yaw += YAW_RATE * dt
+
+            yaw = wrap_deg(yaw)
+
+            # ------------------------------------------------
+            # 2. LOKAL HIZ İSTEKLERİ (WASD)
+            # ------------------------------------------------
+            move_fwd = 0.0
+            move_side = 0.0
+
+            if hasattr(keyboard, 'KeyCode'):
+                if keyboard.KeyCode.from_char('w') in pressed_keys: move_fwd += MOVE_SPEED
+                if keyboard.KeyCode.from_char('s') in pressed_keys: move_fwd -= MOVE_SPEED
+                if keyboard.KeyCode.from_char('d') in pressed_keys: move_side += MOVE_SPEED
+                if keyboard.KeyCode.from_char('a') in pressed_keys: move_side -= MOVE_SPEED
+
+            # ------------------------------------------------
+            # 3. LOKALDEN GLOBALE İZDÜŞÜM (Kinematik)
+            # ------------------------------------------------
+            yaw_rad = math.radians(yaw)
+            
+            # İleri/Geri yönlü hızın global x,z izdüşümü
+            dx = move_fwd * math.sin(yaw_rad) + move_side * math.cos(yaw_rad)
+            dz = move_fwd * math.cos(yaw_rad) - move_side * math.sin(yaw_rad)
+
+            wx += dx * dt
+            wz += dz * dt
+
+            # ------------------------------------------------
+            # 4. VERİ PAKETLEME VE GÖNDERİM
+            # ------------------------------------------------
+            try:
+                send_pose(sock, wx, wz, height, yaw, now - start_time, seq, dt)
+            except Exception as e:
+                print(f"[HATA] UDP Gönderim Hatası: {e}")
+                break
+
+            if seq % int(SEND_HZ / 2) == 0:  # Saniyede 2 kez konsola bilgi yazdır
+                print(f"Pozisyon: ({wx:+.2f}, {wz:+.2f}) | Yaw: {yaw:+.1f}")
+
+            seq += 1
+            
+            # 60Hz döngü frekansını korumak için uyku süresi ayarı
+            sleep_time = DT - (time.perf_counter() - loop_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\n[BILGI] Kontrolcü kapatılıyor...")
+        listener.stop()
+        sock.close()
+
+if __name__ == "__main__":
+    main()
