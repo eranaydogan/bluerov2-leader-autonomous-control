@@ -1,1 +1,3 @@
 pynput
+numpy
+matplotlib
