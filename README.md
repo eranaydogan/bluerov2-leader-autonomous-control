@@ -60,8 +60,13 @@ UDP pose output
 ├── scripts/
 │   ├── leader_autonomous_scan.py
 │   ├── manual_keyboard_control.py
+│   ├── plot_mission_trajectory.py
 │   └── legacy/
 │       └── manual_keyboard_control_6dof.py
+│
+├── docs/
+│   └── media/
+│       └── mission_trajectory.png
 │
 ├── requirements.txt
 ├── .gitignore
@@ -71,6 +76,21 @@ UDP pose output
 ---
 
 # Autonomous Leader Mission
+
+## Mission Trajectory
+
+![Autonomous leader mission trajectory](docs/media/mission_trajectory.png)
+
+Top-down visualization of the autonomous leader mission generated from the same
+geometric parameters used in `leader_autonomous_scan.py`.
+
+The trajectory includes:
+
+- alternating coverage-scan strips,
+- smooth U-turn transitions outside the scan area,
+- entry into the leak-source region,
+- a contracting spiral around the target,
+- and the final emergency-trigger condition.
 
 The main autonomous script is:
 
